@@ -1,0 +1,9 @@
+dist/
+.tmp_versions/
+*.cmd
+*.order
+*.o
+*.mod.c
+*.symvers
+test_queued
+*.ko
