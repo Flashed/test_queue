@@ -21,8 +21,6 @@ License			:		GPL
 #include <linux/semaphore.h>
 #include"fileops.h"
 
-
-
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mikhail Z. <flashed@mail.ru>");
 
@@ -34,22 +32,26 @@ MODULE_AUTHOR("Mikhail Z. <flashed@mail.ru>");
 #define FIRST_DEV_NUM 0
 #define COUNT_DEV_NUM 1
 #define MAX_MESS_SIZE (64 * 1024)
+#define MAX_QUEUUE_ITEMS 1024
+#define SWAP_FILE_PATH "/tmp/queue.swp"
 
 static dev_t dev_num_push = -1;
 static struct cdev *dev_push = NULL;
-static volatile unsigned int dev_push_busy = 0;
-static char *mess_buff_push;
 
 static dev_t dev_num_pop = -1;
 static struct cdev *dev_pop = NULL;
 static volatile unsigned int dev_pop_busy = 0;
 static unsigned int dev_pop_end_mess = 0;
 static struct limited_buff *read_item = NULL;
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+
 
 static struct kfifo queue;
 static struct kfifo files_queue;
-static unsigned int mess_size_count = 0;
 static DEFINE_SPINLOCK(swap_lock);
+
+static struct file* swap_file = NULL;
+static volatile unsigned long long file_write_offset = 0;
 
 //struct for keep queue item information
 struct limited_buff{
@@ -60,7 +62,6 @@ struct limited_buff{
 //struct for keep swap file information
 struct file_pointer{
 	unsigned int len;
-	char path[64];
 };
 
 //Thread for queue swap
@@ -69,12 +70,12 @@ static struct task_struct *task;
 
 int thread_function(void *data)
 {
-	struct file *f;
 	struct file_pointer fp;
 	struct limited_buff lb;
+	unsigned long long file_read_offset = 0;
+
 
 	while(!kthread_should_stop()){
-
 		spin_lock(&swap_lock);
 		while (!kfifo_is_empty(&files_queue)
 				&& kfifo_avail(&queue)){
@@ -84,26 +85,27 @@ int thread_function(void *data)
 				spin_unlock(&swap_lock);
 				break;
 			}
-			f = file_open(fp.path, O_RDONLY,0640);
-			if (!f){
-				PERR("Failed to open %s queue message file.\n", fp.path);
-				spin_unlock(&swap_lock);
-				return 0;
-			}
 			lb.buff = vmalloc(fp.len);
 			if (!lb.buff){
 				spin_unlock(&swap_lock);
 				return -EFAULT;
 			}
 			lb.len = fp.len;
-			file_read(f, 0, lb.buff, lb.len);
-			file_close(f);
+			file_read(swap_file, file_read_offset, lb.buff, lb.len);
+			file_read_offset += fp.len;
 			kfifo_in(&queue, &lb, sizeof(lb));
-			file_remove(fp.path);
-			PINFO("Swap '%s' message to queue. Item size: %d\n", fp.path, lb.len);
+			wake_up_interruptible(&wq);
+			PINFO("Read message to queue from swap file. Item size: %d\n", lb.len);
+		}
+		if (file_read_offset == file_write_offset){
+			file_read_offset = 0;
+			file_write_offset = 0;
 		}
 		spin_unlock(&swap_lock);
-		msleep(1000);
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+		PINFO("Wakeup swap thread!\n");
 	}
 	return 0;
 
@@ -118,6 +120,8 @@ static int dev_pop_open(struct inode *inode, struct file *file)
 	}
 	dev_pop_busy = 1;
 
+	wait_event_interruptible(wq, kfifo_is_empty(&queue) == 0);
+
 	spin_lock(&swap_lock);
 	if (kfifo_is_empty(&queue)){
 		dev_pop_end_mess = 1;
@@ -130,6 +134,7 @@ static int dev_pop_open(struct inode *inode, struct file *file)
 		return -EFAULT;
 	}
 	spin_unlock(&swap_lock);
+	wake_up_process(task);
 
 	dev_pop_end_mess = 0;
 	return 0;
@@ -185,69 +190,62 @@ struct file_operations dev_pop_fops = {
 
 static int dev_push_open(struct inode *inode, struct file *file)
 {
-	if (dev_push_busy){
-		return -EBUSY;
+
+	struct limited_buff *lb = vmalloc(sizeof(struct limited_buff));
+	if (!lb){
+		PERR("Failed to alloc message struct.\n");
+		return -EFAULT;
 	}
-	dev_push_busy = 1;
-	mess_buff_push = vmalloc(MAX_MESS_SIZE);
-	if (!mess_buff_push){
+	lb->buff = vmalloc(MAX_MESS_SIZE);
+	if (!lb->buff){
 		PERR("Failed to alloc message buffer.\n");
 		return -EFAULT;
 	}
+	lb->len = 0;
+	file->private_data = lb;
 	return 0;
 }
 
 static ssize_t dev_push_write(struct file *file, const char __user *buff, size_t size, loff_t *offset)
 {
-	mess_size_count += (size -(*offset));
-	if (mess_size_count > MAX_MESS_SIZE){
-		mess_size_count = 0;
-		PERR("Write too many data. Max message leingth is %d bytes\n", MAX_MESS_SIZE);
-		return mess_size_count;
+	struct limited_buff *lb = file->private_data;
+	unsigned int l = (size -(*offset));
+	lb->len += l;
+	if (lb->len > MAX_MESS_SIZE){
+		lb->len = 0;
+		PERR("Write too many data. Max message length is %d bytes\n", MAX_MESS_SIZE);
+		return lb->len;
 	}
-	if (copy_from_user(mess_buff_push, buff, mess_size_count)){
+	if (copy_from_user(lb->buff, buff, l)){
 		return -EFAULT;
 	}
-	return mess_size_count;
+	return lb->len;
 }
+
+
 
 static int dev_push_release(struct inode *inode, struct file *file)
 {
-	struct limited_buff lb;
+	struct limited_buff *lb = file->private_data;
 	struct file_pointer fp;
-	struct file* f;
-	struct timespec time;
-	getnstimeofday(&time);
 
-
-	if (mess_size_count == 0){
-		goto exit;
+	if (lb->len == 0){
+		return 0;
 	}
-	lb.buff = mess_buff_push;
-	lb.len = mess_size_count;
-
 	spin_lock(&swap_lock);
 	if (!kfifo_is_empty(&files_queue)
 			|| !kfifo_avail(&queue)){
-		fp.len = mess_size_count;
-		sprintf(fp.path, "/tmp/%ld", time.tv_nsec);
-
-		f = file_open(fp.path,  O_WRONLY | O_CREAT | O_TRUNC, 0666);
-		file_write(f, 0, lb.buff, fp.len);
-		file_sync(f);
-		file_close(f);
+		fp.len = lb->len;
+		file_write(swap_file, file_write_offset, lb->buff, fp.len);
+		file_write_offset += fp.len;
 		kfifo_in(&files_queue, &fp, sizeof(fp));
-		PINFO("Pushed item to SWAP queue. File: %s \n", fp.path);
+		PINFO("Pushed item to SWAP file queue.\n");
 	} else {
-		kfifo_in(&queue, &lb, sizeof(lb));
-		PINFO("Pushed item to queue. Queue size: %ld\n", (kfifo_len(&queue)/(sizeof(lb))));
+		kfifo_in(&queue, lb, sizeof(*lb));
+		wake_up_interruptible(&wq);
+		PINFO("Pushed item to queue. Queue size: %ld\n", (kfifo_len(&queue)/(sizeof(*lb))));
 	}
-
 	spin_unlock(&swap_lock);
-exit:
-	mess_size_count = 0;
-	dev_push_busy = 0;
-
 	return 0;
 }
 
@@ -271,7 +269,7 @@ static void free_if_alloc(void)
 		cdev_del(dev_push);
 	}
 	if (dev_pop != NULL){
-			cdev_del(dev_pop);
+		cdev_del(dev_pop);
 	}
 	if (dev_num_push != -1){
 		unregister_chrdev_region(dev_num_push, COUNT_DEV_NUM);
@@ -279,9 +277,9 @@ static void free_if_alloc(void)
 	if (dev_num_pop != -1){
 		unregister_chrdev_region(dev_num_pop, COUNT_DEV_NUM);
 	}
-
-	if (mess_buff_push != NULL){
-		kvfree(mess_buff_push);
+	if (swap_file != NULL){
+		file_close(swap_file);
+		file_remove(SWAP_FILE_PATH);
 	}
 	if (read_item != NULL){
 		kvfree(read_item);
@@ -333,7 +331,7 @@ static int __init test_zaytsev_mod_init(void)
 	}
 
 	//Init queue
-	err = kfifo_alloc(&queue, (1024 * sizeof(struct limited_buff)), GFP_KERNEL);
+	err = kfifo_alloc(&queue, (MAX_QUEUUE_ITEMS * sizeof(struct limited_buff)), GFP_KERNEL);
 	if (err != 0){
 		PERR("Failed to allocate queue. Error code: %d\n", err);
 		free_if_alloc();
@@ -341,11 +339,18 @@ static int __init test_zaytsev_mod_init(void)
 	}
 
 	//Init files_queue (swap loading)
-	err = kfifo_alloc(&files_queue, (1024 * sizeof(struct file_pointer)), GFP_KERNEL);
+	err = kfifo_alloc(&files_queue, (MAX_QUEUUE_ITEMS * sizeof(struct file_pointer) * 1024), GFP_KERNEL);
 	if (err != 0){
 		PERR("Failed to allocate files_queue. Error code: %d\n", err);
 		free_if_alloc();
 		return err;
+	}
+
+	swap_file = file_open(SWAP_FILE_PATH, O_RDWR | O_CREAT | O_TRUNC, 0766);
+	if (!swap_file){
+		PERR("Failed to open spaw queue file\n");
+		free_if_alloc();
+		return -EFAULT;
 	}
 
 	task = kthread_run(&thread_function, 0,"queue_swap_thread");

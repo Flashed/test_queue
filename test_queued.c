@@ -181,7 +181,6 @@ int main(int argc,char **argv){
     		log_message(LOG_FILE, log_mess);
     		continue;
     	}
-    	sleep(1);
     }
 
 }
